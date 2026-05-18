@@ -1,8 +1,11 @@
 import { useState } from "react";
 import { Link } from "react-router-dom";
+import { BigNumber } from "ethers";
+import { getCertificateRegistry } from "@/contracts/certificateRegistry";
+import { useEthersProvider } from "@/lib/wagmi";
 import { cn } from "@/lib/utils";
 
-type CertificateStatus = "CREATED" | "ISSUED" | "REVOKED";
+type CertificateStatus = "CREATED" | "ISSUED" | "SUSPENDED" | "REVOKED";
 
 type CertificateResult = {
   id: string;
@@ -32,10 +35,13 @@ const quickSteps = [
 ];
 
 function VerifyPage() {
+  const provider = useEthersProvider();
   const [certificateId, setCertificateId] = useState("");
   const [result, setResult] = useState<CertificateResult | null>(null);
+  const [message, setMessage] = useState("");
+  const [isVerifying, setIsVerifying] = useState(false);
 
-  const handleVerify = () => {
+  const handleVerifyMock = () => {
     setResult({
       id: certificateId || "CERT001",
       student: "Nguyễn Văn A",
@@ -46,12 +52,63 @@ function VerifyPage() {
     });
   };
 
+  const handleVerify = async () => {
+    const normalizedId = certificateId.trim();
+    if (!provider) {
+      setMessage("Vui lòng kết nối ví Sepolia trước khi xác thực.");
+      return;
+    }
+    if (!normalizedId) {
+      setMessage("Vui lòng nhập mã chứng nhận.");
+      return;
+    }
+
+    try {
+      setIsVerifying(true);
+      setMessage("Đang đọc dữ liệu từ blockchain...");
+      const contract = getCertificateRegistry(provider);
+      const [exists] = await contract.verifyAsset(normalizedId);
+
+      if (!exists) {
+        setResult(null);
+        setMessage("Không tìm thấy chứng nhận trên blockchain.");
+        return;
+      }
+
+      const asset = await contract.getAsset(normalizedId);
+      setResult({
+        id: asset.assetId,
+        student: asset.holderName,
+        course: asset.assetName,
+        status: mapStatus(asset.status),
+        issuer: asset.issuer,
+        issuedAt: asset.issuedDate,
+      });
+      setMessage("");
+    } catch (error) {
+      setResult(null);
+      setMessage((error as Error).message || "Không thể xác thực chứng nhận.");
+    } finally {
+      setIsVerifying(false);
+    }
+  };
+
+  const mapStatus = (status: BigNumber | number): CertificateStatus => {
+    const value = BigNumber.isBigNumber(status) ? status.toNumber() : status;
+    if (value === 1) return "ISSUED";
+    if (value === 2) return "SUSPENDED";
+    if (value === 3) return "REVOKED";
+    return "CREATED";
+  };
+
   const getStatusLabel = (status: CertificateStatus) => {
     switch (status) {
       case "ISSUED":
         return "Hợp lệ";
       case "CREATED":
         return "Đã tạo";
+      case "SUSPENDED":
+        return "Tam dung";
       case "REVOKED":
         return "Thu hồi";
       default:
@@ -65,6 +122,8 @@ function VerifyPage() {
         return "border-amber-200/60 bg-amber-500/10 text-amber-700 ring-amber-500/20 dark:border-amber-800/50 dark:text-amber-300";
       case "ISSUED":
         return "border-emerald-200/60 bg-emerald-500/10 text-emerald-700 ring-emerald-500/20 dark:border-emerald-800/50 dark:text-emerald-300";
+      case "SUSPENDED":
+        return "border-sky-200/60 bg-sky-500/10 text-sky-700 ring-sky-500/20 dark:border-sky-800/50 dark:text-sky-300";
       case "REVOKED":
         return "border-red-200/60 bg-red-500/10 text-red-700 ring-red-500/20 dark:border-red-800/50 dark:text-red-300";
       default:
@@ -134,11 +193,17 @@ function VerifyPage() {
                   <button
                     type="button"
                     onClick={handleVerify}
-                    className="w-full rounded-2xl bg-gradient-to-r from-primary to-emerald-500 px-8 py-4 text-lg font-semibold text-primary-foreground shadow-[0_18px_44px_-18px_rgba(16,185,129,0.42)] transition-all duration-200 hover:-translate-y-0.5 hover:shadow-[0_22px_50px_-18px_rgba(16,185,129,0.48)] focus:outline-none focus:ring-4 focus:ring-primary/20"
+                    disabled={isVerifying}
+                    className="w-full rounded-2xl bg-gradient-to-r from-primary to-emerald-500 px-8 py-4 text-lg font-semibold text-primary-foreground shadow-[0_18px_44px_-18px_rgba(16,185,129,0.42)] transition-all duration-200 hover:-translate-y-0.5 hover:shadow-[0_22px_50px_-18px_rgba(16,185,129,0.48)] focus:outline-none focus:ring-4 focus:ring-primary/20 disabled:cursor-not-allowed disabled:opacity-70"
                   >
                     Xác thực ngay
                   </button>
                 </div>
+                {message && (
+                  <p className="mt-4 rounded-2xl border border-border bg-background px-5 py-4 text-sm font-semibold text-foreground">
+                    {message}
+                  </p>
+                )}
               </div>
             </div>
 

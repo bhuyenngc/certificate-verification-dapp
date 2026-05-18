@@ -1,9 +1,16 @@
-import { useEffect, useMemo, useState } from "react";
+﻿import { useEffect, useMemo, useState } from "react";
+import { utils } from "ethers";
 import { Link } from "react-router-dom";
 import certIcon from "@/assets/certificate.png";
 import verifyIcon from "@/assets/verify.png";
 import pendingIcon from "@/assets/pending.png";
 import updateIcon from "@/assets/update.png";
+import {
+  certificateRegistryAddress,
+  certificateRegistryChainId,
+  getCertificateRegistry,
+} from "@/contracts/certificateRegistry";
+import { useEthersProvider } from "@/lib/wagmi";
 
 type StatItem = {
   label: string;
@@ -78,9 +85,139 @@ const recentActivities = [
   },
 ];
 
+type RecentActivity = {
+  name: string;
+  course: string;
+  status: string;
+  time: string;
+  blockNumber?: number;
+  logIndex?: number;
+};
+
+type SystemStatus = {
+  connection: string;
+  network: string;
+  chainId: string;
+  contract: string;
+  latestBlock: string;
+  gasPrice: string;
+};
+
 function ActivityPage() {
+  const provider = useEthersProvider();
   const [showActivities, setShowActivities] = useState(false);
   const [showSystemStatus, setShowSystemStatus] = useState(false);
+  const [activities, setActivities] = useState<RecentActivity[]>([]);
+  const [activityMessage, setActivityMessage] = useState("");
+  const [systemStatus, setSystemStatus] = useState<SystemStatus>({
+    connection: "Chưa kết nối",
+    network: "Sepolia Testnet",
+    chainId: String(certificateRegistryChainId),
+    contract: certificateRegistryAddress,
+    latestBlock: "Chưa tải",
+    gasPrice: "Chưa tải",
+  });
+
+  useEffect(() => {
+    if (!provider) {
+      setActivities([]);
+      setActivityMessage("Vui lòng kết nối ví để tải hoạt động từ blockchain.");
+      return;
+    }
+
+    const loadActivities = async () => {
+      try {
+        setActivities([]);
+        setActivityMessage("Đang tải hoạt động từ blockchain...");
+        const contract = getCertificateRegistry(provider);
+        const latestBlock = await provider.getBlockNumber();
+        const fromBlock = Math.max(0, latestBlock - 999);
+        const [createdEvents, statusEvents] = await Promise.all([
+          contract.queryFilter(contract.filters.AssetCreated(), fromBlock, latestBlock),
+          contract.queryFilter(contract.filters.AssetStatusUpdated(), fromBlock, latestBlock),
+        ]);
+
+        const rows = await Promise.all(
+          [...createdEvents, ...statusEvents].map(async (event) => {
+            const assetId = event.args?.assetId as string | undefined;
+            if (!assetId) return null;
+
+            const [asset, block] = await Promise.all([
+              contract.getAsset(assetId),
+              provider.getBlock(event.blockNumber),
+            ]);
+            const newStatus = parseEventStatus(event.args?.newStatus);
+
+            return {
+              name: asset.holderName || assetId,
+              course: asset.assetName || assetId,
+              status: event.event === "AssetCreated" ? "Đã tạo" : getStatusText(newStatus),
+              time: formatActivityTime(block.timestamp),
+              blockNumber: event.blockNumber,
+              logIndex: event.logIndex,
+            };
+          })
+        );
+
+        const nextActivities: RecentActivity[] = rows
+          .filter((item): item is NonNullable<typeof item> => item !== null)
+          .sort(
+            (a, b) =>
+              (b.blockNumber || 0) - (a.blockNumber || 0) ||
+              (b.logIndex || 0) - (a.logIndex || 0)
+          )
+          .slice(0, 10);
+
+        setActivities(nextActivities);
+        setActivityMessage(nextActivities.length ? "" : "Chưa có hoạt động nào trên contract.");
+      } catch (error) {
+        setActivities([]);
+        setActivityMessage((error as Error).message || "Không thể tải hoạt động blockchain.");
+      }
+    };
+
+    loadActivities();
+  }, [provider]);
+
+  useEffect(() => {
+    if (!provider) {
+      setSystemStatus((current) => ({
+        ...current,
+        connection: "Chưa kết nối",
+        latestBlock: "Chưa tải",
+        gasPrice: "Chưa tải",
+      }));
+      return;
+    }
+
+    const loadSystemStatus = async () => {
+      try {
+        const [network, latestBlock, gasPrice] = await Promise.all([
+          provider.getNetwork(),
+          provider.getBlockNumber(),
+          provider.getGasPrice(),
+        ]);
+
+        setSystemStatus({
+          connection: network.chainId === certificateRegistryChainId ? "Đã kết nối" : "Sai network",
+          network: getNetworkName(network.name, network.chainId),
+          chainId: String(network.chainId),
+          contract: certificateRegistryAddress,
+          latestBlock: latestBlock.toLocaleString("en-US"),
+          gasPrice: `${Number(utils.formatUnits(gasPrice, "gwei")).toFixed(2)} Gwei`,
+        });
+      } catch (error) {
+        setSystemStatus((current) => ({
+          ...current,
+          connection: "Lỗi kết nối",
+          latestBlock: "Không tải được",
+          gasPrice: "Không tải được",
+        }));
+      }
+    };
+
+    loadSystemStatus();
+  }, [provider]);
 
   return (
     <div className="min-h-screen bg-slate-50 dark:bg-slate-950">
@@ -217,7 +354,12 @@ function ActivityPage() {
 
     {showActivities && (
       <div className="mt-8 space-y-4">
-        {recentActivities.map((item, index) => (
+        {activityMessage && (
+          <p className="rounded-2xl border border-slate-200 bg-white px-5 py-4 text-sm font-semibold text-slate-700 dark:border-slate-800 dark:bg-slate-950/60 dark:text-slate-300">
+            {activityMessage}
+          </p>
+        )}
+        {activities.map((item, index) => (
           <div
             key={`${item.name}-${item.time}`}
             className="rounded-[26px] border border-slate-100 bg-white px-5 py-5 shadow-sm dark:border-slate-800 dark:bg-slate-950/60"
@@ -299,21 +441,43 @@ function ActivityPage() {
 
         <div className="mt-8 grid gap-4 md:grid-cols-3">
           <StatusRow
-            label="Network đang kết nối"
-            value="Sepolia Testnet"
-            valueClass="text-emerald-600 dark:text-emerald-400"
+            label="Trạng thái"
+            value={systemStatus.connection}
+            valueClass={
+              systemStatus.connection === "Đã kết nối"
+                ? "text-emerald-600 dark:text-emerald-400"
+                : "text-amber-600 dark:text-amber-300"
+            }
           />
-          <StatusRow label="Smart contract" value="0x4F9...A123" />
-          <StatusRow label="Gas price" value="12 Gwei" />
+          <StatusRow label="Network" value={systemStatus.network} />
+          <StatusRow label="Chain ID" value={systemStatus.chainId} />
+          <StatusRow label="Smart contract" value={shortAddress(systemStatus.contract)} />
+          <StatusRow label="Block mới nhất" value={systemStatus.latestBlock} />
+          <StatusRow label="Gas price" value={systemStatus.gasPrice} />
         </div>
 
-        <div className="mt-5 rounded-[24px] border border-emerald-200 bg-emerald-50 px-5 py-5 dark:border-emerald-900/50 dark:bg-emerald-950/30">
-          <p className="text-sm font-bold uppercase tracking-[0.14em] text-emerald-700 dark:text-emerald-300">
-            HỆ THỐNG ỔN ĐỊNH
+        <div
+          className={`mt-5 rounded-[24px] border px-5 py-5 ${
+            systemStatus.connection === "Đã kết nối"
+              ? "border-emerald-200 bg-emerald-50 dark:border-emerald-900/50 dark:bg-emerald-950/30"
+              : "border-amber-200 bg-amber-50 dark:border-amber-900/50 dark:bg-amber-950/30"
+          }`}
+        >
+          <p
+            className={`text-sm font-bold uppercase tracking-[0.14em] ${
+              systemStatus.connection === "Đã kết nối"
+                ? "text-emerald-700 dark:text-emerald-300"
+                : "text-amber-700 dark:text-amber-300"
+            }`}
+          >
+            {systemStatus.connection === "Đã kết nối"
+              ? "HỆ THỐNG ĐANG KẾT NỐI"
+              : "CẦN KIỂM TRA KẾT NỐI"}
           </p>
           <p className="mt-3 text-base leading-7 text-slate-700 dark:text-slate-300">
-            Smart contract đang phản hồi bình thường, dữ liệu có thể được tra cứu và cập nhật theo
-            luồng giao diện hiện tại.
+            Smart contract {shortAddress(certificateRegistryAddress)} đang được cấu hình cho
+            Sepolia. Nếu trạng thái báo sai network, hãy chuyển MetaMask về Sepolia trước khi tạo
+            hoặc cập nhật chứng nhận.
           </p>
         </div>
 
@@ -361,24 +525,39 @@ function StatCard({ item }: { item: StatItem }) {
   );
 }
 function StatusBadge({ status }: { status: string }) {
-  const statusMap: Record<string, string> = {
-    "Đã phát hành": "border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-900/50 dark:bg-emerald-950/30 dark:text-emerald-300",
-    "Đã xác thực": "border-blue-200 bg-blue-50 text-blue-700 dark:border-blue-900/50 dark:bg-blue-950/30 dark:text-blue-300",
-    "Đã thu hồi": "border-rose-200 bg-rose-50 text-rose-700 dark:border-rose-900/50 dark:bg-rose-950/30 dark:text-rose-300",
-    "Đã tạo": "border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-900/50 dark:bg-amber-950/30 dark:text-amber-300",
+  const badgeClasses: Record<string, string> = {
+    issued: "border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-900/50 dark:bg-emerald-950/30 dark:text-emerald-300",
+    verified: "border-blue-200 bg-blue-50 text-blue-700 dark:border-blue-900/50 dark:bg-blue-950/30 dark:text-blue-300",
+    revoked: "border-rose-200 bg-rose-50 text-rose-700 dark:border-rose-900/50 dark:bg-rose-950/30 dark:text-rose-300",
+    created: "border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-900/50 dark:bg-amber-950/30 dark:text-amber-300",
+    suspended: "border-sky-200 bg-sky-50 text-sky-700 dark:border-sky-900/50 dark:bg-sky-950/30 dark:text-sky-300",
+    default: "border-slate-200 bg-slate-50 text-slate-700 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300",
   };
+
+  const normalizedStatus = status
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
+  const statusTone = normalizedStatus.includes("phat hanh")
+    ? "issued"
+    : normalizedStatus.includes("xac thuc")
+      ? "verified"
+      : normalizedStatus.includes("thu hoi")
+        ? "revoked"
+        : normalizedStatus.includes("tam dung")
+          ? "suspended"
+          : normalizedStatus.includes("tao")
+            ? "created"
+            : "default";
 
   return (
     <span
-      className={`inline-flex w-full justify-center rounded-full border px-3 py-1 text-sm font-bold ${
-        statusMap[status] || "border-slate-200 bg-slate-50 text-slate-700 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300"
-      }`}
+      className={`inline-flex w-full justify-center rounded-full border px-3 py-1 text-sm font-bold ${badgeClasses[statusTone]}`}
     >
       {status}
     </span>
   );
 }
-
 function StatusRow({
   label,
   value,
@@ -456,6 +635,48 @@ function MiniMetric({
     </div>
   );
 }
+
+function getStatusText(status: number | undefined) {
+  if (status === 1) return "Đã phát hành";
+  if (status === 2) return "Tạm dừng";
+  if (status === 3) return "Đã thu hồi";
+  return "Đã tạo";
+}
+
+function parseEventStatus(value: unknown) {
+  if (typeof value === "number") return value;
+  if (typeof value === "bigint") return Number(value);
+  if (value && typeof (value as { toNumber?: () => number }).toNumber === "function") {
+    return (value as { toNumber: () => number }).toNumber();
+  }
+  if (value !== undefined && value !== null) {
+    const numericValue = Number(value);
+    return Number.isNaN(numericValue) ? undefined : numericValue;
+  }
+  return undefined;
+}
+
+function formatActivityTime(timestamp: number) {
+  const seconds = Math.max(0, Math.floor(Date.now() / 1000 - timestamp));
+  if (seconds < 60) return "Vừa xong";
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes} phút trước`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} giờ trước`;
+  const days = Math.floor(hours / 24);
+  return `${days} ngày trước`;
+}
+
+function getNetworkName(name: string, chainId: number) {
+  if (chainId === certificateRegistryChainId) return "Sepolia Testnet";
+  return name && name !== "unknown" ? name : `Chain ${chainId}`;
+}
+
+function shortAddress(address: string) {
+  if (!address || address.length <= 12) return address;
+  return `${address.slice(0, 6)}...${address.slice(-4)}`;
+}
+
 export default ActivityPage;
 
 function CountUpNumber({
@@ -500,3 +721,4 @@ function CountUpNumber({
 
   return <>{displayValue.toLocaleString("en-US")}</>;
 }
+

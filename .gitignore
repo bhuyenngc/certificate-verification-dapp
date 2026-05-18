@@ -10,7 +10,12 @@ lerna-debug.log*
 node_modules
 dist
 dist-ssr
+artifacts
+cache
 *.local
+.env
+.env.*
+!.env.example
 
 # Editor directories and files
 .vscode/*
@@ -23,4 +28,3 @@ dist-ssr
 *.sln
 *.sw?
 stats.html
-!.env

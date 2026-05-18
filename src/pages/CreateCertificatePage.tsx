@@ -1,7 +1,10 @@
+import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import formIcon from "@/assets/form.png";
 import chainIcon2 from "@/assets/blockchain2.png";
 import shareIcon from "@/assets/share.png";
+import { canManageCertificates, getCertificateRegistry } from "@/contracts/certificateRegistry";
+import { useEthersSigner } from "@/lib/wagmi";
 
 const highlights = [
   {
@@ -44,7 +47,84 @@ const formFields = [
   },
 ];
 
+const formFieldNames = ["assetId", "holderName", "assetName", "issuedDate"] as const;
+
 function CreateCertificatePage() {
+  const signer = useEthersSigner();
+  const [form, setForm] = useState({
+    assetId: "",
+    holderName: "",
+    assetName: "",
+    issuedDate: "",
+    metadataURI: "",
+  });
+  const [message, setMessage] = useState("");
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [showPreview, setShowPreview] = useState(false);
+  const [canManage, setCanManage] = useState<boolean | null>(null);
+
+  useEffect(() => {
+    let isMounted = true;
+
+    const checkPermission = async () => {
+      if (!signer) {
+        setCanManage(null);
+        return;
+      }
+
+      try {
+        const hasPermission = await canManageCertificates(signer);
+        if (isMounted) setCanManage(hasPermission);
+      } catch {
+        if (isMounted) setCanManage(false);
+      }
+    };
+
+    checkPermission();
+
+    return () => {
+      isMounted = false;
+    };
+  }, [signer]);
+
+  const handleCreate = async () => {
+    if (!signer) {
+      setMessage("Vui lòng kết nối ví trước khi tạo chứng nhận.");
+      return;
+    }
+    if (canManage === false) {
+      setMessage("Bạn không có quyền tạo chứng nhận. Chỉ ví của đơn vị phát hành hoặc quản trị viên mới được thực hiện thao tác này.");
+      return;
+    }
+    if (!form.assetId || !form.holderName || !form.assetName || !form.issuedDate) {
+      setMessage("Vui lòng nhập đầy đủ thông tin bắt buộc.");
+      return;
+    }
+
+    try {
+      setIsSubmitting(true);
+      setMessage("Đang gửi giao dịch lên blockchain...");
+      const contract = getCertificateRegistry(signer);
+      const createTx = await contract.createAsset(
+        form.assetId,
+        form.holderName,
+        form.assetName,
+        form.metadataURI,
+        form.issuedDate,
+        { gasLimit: 500000 }
+      );
+      await createTx.wait();
+      const issueTx = await contract.issueAsset(form.assetId, "Issued from frontend", { gasLimit: 300000 });
+      await issueTx.wait();
+      setMessage(`Đã tạo và phát hành chứng nhận ${form.assetId}.`);
+    } catch (error) {
+      const reason = (error as { reason?: string; message?: string }).reason;
+      setMessage(reason ? `Giao dịch thất bại: ${reason}` : "Giao dịch thất bại. Kiểm tra MetaMask, gas hoặc mã chứng nhận đã tồn tại.");
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
   return (
     <div className="py-12 md:py-16 lg:py-20">
       <div className="mx-auto flex max-w-6xl flex-col gap-16 px-6 lg:px-8">
@@ -84,7 +164,14 @@ function CreateCertificatePage() {
             </div>
 
             <div className="grid gap-7">
-              {formFields.map((field) => (
+              {canManage === false && (
+                <p className="rounded-2xl border border-amber-200 bg-amber-50 px-5 py-4 text-sm font-semibold text-amber-800 dark:border-amber-900/50 dark:bg-amber-950/30 dark:text-amber-300">
+                  Bạn không có quyền tạo chứng nhận. Ví hiện tại chỉ có thể xác thực và xem chi tiết chứng nhận.
+                </p>
+              )}
+              {formFields.map((field, index) => {
+                const fieldName = formFieldNames[index];
+                return (
                 <div key={field.label} className="space-y-3">
                   <label className="block text-sm font-semibold uppercase tracking-[0.14em] text-muted-foreground">
                     {field.label}
@@ -92,24 +179,118 @@ function CreateCertificatePage() {
 
                   <input
                     type={field.type}
+                    value={form[fieldName]}
+                    onChange={(event) =>
+                      setForm((current) => ({ ...current, [fieldName]: event.target.value }))
+                    }
                     placeholder={field.placeholder}
                     className="h-15 w-full rounded-2xl border border-border/60 bg-background px-5 py-4 text-base text-foreground shadow-sm transition-all duration-200 placeholder:text-muted-foreground/80 focus:border-primary/40 focus:outline-none focus:ring-4 focus:ring-primary/10"
                   />
                 </div>
-              ))}
+                );
+              })}
             </div>
 
             <div className="mt-10 flex flex-col gap-4 md:flex-row">
-              <button className="flex-1 rounded-2xl bg-gradient-to-r from-emerald-500 to-emerald-600 px-8 py-4 text-lg font-semibold text-white shadow-[0_18px_44px_-18px_rgba(16,185,129,0.45)] transition-all duration-200 hover:-translate-y-0.5 hover:shadow-[0_22px_50px_-18px_rgba(16,185,129,0.52)] focus:outline-none focus:ring-4 focus:ring-emerald-500/20">
+              <button
+                type="button"
+                onClick={handleCreate}
+                disabled={isSubmitting || canManage === false}
+                className="flex-1 rounded-2xl bg-gradient-to-r from-emerald-500 to-emerald-600 px-8 py-4 text-lg font-semibold text-white shadow-[0_18px_44px_-18px_rgba(16,185,129,0.45)] transition-all duration-200 hover:-translate-y-0.5 hover:shadow-[0_22px_50px_-18px_rgba(16,185,129,0.52)] focus:outline-none focus:ring-4 focus:ring-emerald-500/20 disabled:cursor-not-allowed disabled:opacity-70"
+              >
                 Tạo & Phát hành
               </button>
 
-              <button className="flex-1 rounded-2xl border border-border bg-background px-8 py-4 text-lg font-semibold text-foreground transition-all duration-200 hover:-translate-y-0.5 hover:bg-accent hover:shadow-sm focus:outline-none focus:ring-4 focus:ring-primary/10">
-                Xem mẫu PDF
+              <button
+                type="button"
+                onClick={() => setShowPreview(true)}
+                className="flex-1 rounded-2xl border border-border bg-background px-8 py-4 text-lg font-semibold text-foreground transition-all duration-200 hover:-translate-y-0.5 hover:bg-accent hover:shadow-sm focus:outline-none focus:ring-4 focus:ring-primary/10"
+              >
+                Xem trước chứng nhận
               </button>
             </div>
+            {message && (
+              <p className="mt-5 rounded-2xl border border-border bg-background px-5 py-4 text-sm font-semibold text-foreground">
+                {message}
+              </p>
+            )}
           </div>
         </section>
+
+        {showPreview && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+            <button
+              type="button"
+              aria-label="Đóng xem trước"
+              onClick={() => setShowPreview(false)}
+              className="absolute inset-0 bg-slate-950/55 backdrop-blur-[3px]"
+            />
+
+            <div className="relative z-10 w-full max-w-3xl overflow-hidden rounded-[28px] border border-border bg-background shadow-[0_40px_120px_-32px_rgba(15,23,42,0.35)]">
+              <div className="absolute inset-x-0 top-0 h-1 bg-gradient-to-r from-emerald-500 via-teal-500 to-blue-500" />
+              <div className="p-6 md:p-8">
+                <div className="flex items-start justify-between gap-4">
+                  <div>
+                    <p className="text-sm font-bold uppercase tracking-[0.18em] text-emerald-700 dark:text-emerald-300">
+                      BẢN XEM TRƯỚC
+                    </p>
+                    <h3 className="mt-2 text-2xl font-black text-foreground">
+                      Chứng nhận học tập
+                    </h3>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={() => setShowPreview(false)}
+                    className="inline-flex h-10 w-10 items-center justify-center rounded-full border border-border bg-background text-xl font-bold text-muted-foreground transition hover:bg-accent"
+                  >
+                    ×
+                  </button>
+                </div>
+
+                <div className="mt-6 rounded-[24px] border border-emerald-200 bg-gradient-to-br from-white via-emerald-50/70 to-blue-50/70 p-6 text-center shadow-inner dark:border-emerald-900/50 dark:from-slate-950 dark:via-emerald-950/20 dark:to-blue-950/20 md:p-8">
+                  <p className="text-sm font-bold uppercase tracking-[0.2em] text-emerald-700 dark:text-emerald-300">
+                    CertChain
+                  </p>
+                  <h4 className="mt-4 text-3xl font-black text-slate-950 dark:text-white md:text-4xl">
+                    Chứng nhận hoàn thành
+                  </h4>
+                  <p className="mt-5 text-base text-slate-600 dark:text-slate-300">
+                    Xác nhận rằng
+                  </p>
+                  <p className="mt-2 text-3xl font-black text-emerald-700 dark:text-emerald-300">
+                    {form.holderName || "Tên người nhận"}
+                  </p>
+                  <p className="mx-auto mt-5 max-w-2xl text-lg leading-8 text-slate-700 dark:text-slate-300">
+                    đã hoàn thành khóa học
+                    <span className="font-bold text-slate-950 dark:text-white">
+                      {" "}
+                      {form.assetName || "Tên khóa học"}
+                    </span>
+                    .
+                  </p>
+
+                  <div className="mt-8 grid gap-4 text-left md:grid-cols-2">
+                    <PreviewItem label="Mã chứng nhận" value={form.assetId || "CERT-2026-001"} />
+                    <PreviewItem label="Ngày cấp" value={formatPreviewDate(form.issuedDate)} />
+                    <PreviewItem label="Mạng" value="Ethereum Sepolia" />
+                    <PreviewItem label="Trạng thái" value="Bản nháp trước khi phát hành" />
+                  </div>
+                </div>
+
+                <div className="mt-6 flex justify-end">
+                  <button
+                    type="button"
+                    onClick={() => setShowPreview(false)}
+                    className="rounded-2xl bg-emerald-600 px-6 py-3 text-base font-bold text-white transition hover:bg-emerald-700"
+                  >
+                    Đóng xem trước
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* HIGHLIGHTS */}
         <section className="mx-auto w-full max-w-6xl">
@@ -167,6 +348,29 @@ function CreateCertificatePage() {
       </div>
     </div>
   );
+}
+
+function PreviewItem({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-2xl border border-white/80 bg-white/80 px-4 py-3 shadow-sm dark:border-slate-800 dark:bg-slate-900/70">
+      <p className="text-xs font-bold uppercase tracking-[0.16em] text-slate-500 dark:text-slate-400">
+        {label}
+      </p>
+      <p className="mt-2 text-base font-bold text-slate-900 dark:text-slate-100">
+        {value}
+      </p>
+    </div>
+  );
+}
+
+function formatPreviewDate(date: string) {
+  if (!date) return "Chưa chọn ngày cấp";
+
+  return new Intl.DateTimeFormat("vi-VN", {
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+  }).format(new Date(date));
 }
 
 export default CreateCertificatePage;

@@ -1,12 +1,24 @@
+﻿import { useEffect, useState } from "react";
 import searchIcon from "@/assets/search2.png";
 import statusIcon from "@/assets/status.png";
 import recordIcon from "@/assets/record.png";
+import { canManageCertificates, getCertificateRegistry } from "@/contracts/certificateRegistry";
+import { useEthersProvider, useEthersSigner } from "@/lib/wagmi";
 
 type UpdateStep = {
   step: string;
   icon: string;
   title: string;
   desc: string;
+};
+
+type CertificateListItem = {
+  assetId: string;
+  holderName: string;
+  assetName: string;
+  status: string;
+  blockNumber: number;
+  logIndex: number;
 };
 
 const updateSteps: UpdateStep[] = [
@@ -46,6 +58,148 @@ const statusHints = [
 ];
 
 function UpdateCertificatePage() {
+  const signer = useEthersSigner();
+  const provider = useEthersProvider();
+  const [assetId, setAssetId] = useState("");
+  const [status, setStatus] = useState("1");
+  const [updateDate, setUpdateDate] = useState("");
+  const [note, setNote] = useState("");
+  const [message, setMessage] = useState("");
+  const [isUpdating, setIsUpdating] = useState(false);
+  const [showCertificateList, setShowCertificateList] = useState(false);
+  const [certificateList, setCertificateList] = useState<CertificateListItem[]>([]);
+  const [listMessage, setListMessage] = useState("");
+  const [canManage, setCanManage] = useState<boolean | null>(null);
+
+  useEffect(() => {
+    let isMounted = true;
+
+    const checkPermission = async () => {
+      if (!signer) {
+        setCanManage(null);
+        return;
+      }
+
+      try {
+        const hasPermission = await canManageCertificates(signer);
+        if (isMounted) setCanManage(hasPermission);
+      } catch {
+        if (isMounted) setCanManage(false);
+      }
+    };
+
+    checkPermission();
+
+    return () => {
+      isMounted = false;
+    };
+  }, [signer]);
+
+  useEffect(() => {
+    if (!showCertificateList) return;
+
+    if (!provider) {
+      setCertificateList([]);
+      setListMessage("Vui lòng kết nối ví để tải danh sách chứng nhận.");
+      return;
+    }
+
+    const loadCertificateList = async () => {
+      try {
+        setCertificateList([]);
+        setListMessage("Đang tải danh sách chứng nhận từ blockchain...");
+        const contract = getCertificateRegistry(provider);
+        const latestBlock = await provider.getBlockNumber();
+        const fromBlock = Math.max(0, latestBlock - 999);
+        const [createdEvents, statusEvents] = await Promise.all([
+          contract.queryFilter(contract.filters.AssetCreated(), fromBlock, latestBlock),
+          contract.queryFilter(contract.filters.AssetStatusUpdated(), fromBlock, latestBlock),
+        ]);
+
+        const latestEventsByAsset = new Map<string, { blockNumber: number; logIndex: number }>();
+        [...createdEvents, ...statusEvents].forEach((event) => {
+          const eventAssetId = event.args?.assetId as string | undefined;
+          if (!eventAssetId) return;
+
+          const current = latestEventsByAsset.get(eventAssetId);
+          const isNewer =
+            !current ||
+            event.blockNumber > current.blockNumber ||
+            (event.blockNumber === current.blockNumber && event.logIndex > current.logIndex);
+
+          if (isNewer) {
+            latestEventsByAsset.set(eventAssetId, {
+              blockNumber: event.blockNumber,
+              logIndex: event.logIndex,
+            });
+          }
+        });
+
+        const rows = await Promise.all(
+          [...latestEventsByAsset.entries()].map(async ([eventAssetId, position]) => {
+            const asset = await contract.getAsset(eventAssetId);
+            return {
+              assetId: asset.assetId || eventAssetId,
+              holderName: asset.holderName || "Chưa có tên người nhận",
+              assetName: asset.assetName || "Chưa có tên khóa học",
+              status: getStatusText(parseContractStatus(asset.status)),
+              blockNumber: position.blockNumber,
+              logIndex: position.logIndex,
+            };
+          })
+        );
+
+        const nextList = rows
+          .sort(
+            (a, b) =>
+              b.blockNumber - a.blockNumber ||
+              b.logIndex - a.logIndex
+          )
+          .slice(0, 12);
+
+        setCertificateList(nextList);
+        setListMessage(nextList.length ? "" : "Chưa có chứng nhận nào trên contract.");
+      } catch (error) {
+        setCertificateList([]);
+        setListMessage((error as Error).message || "Không thể tải danh sách chứng nhận.");
+      }
+    };
+
+    loadCertificateList();
+  }, [provider, showCertificateList]);
+
+  const handleUpdate = async () => {
+    if (!signer) {
+      setMessage("Vui lòng kết nối ví Sepolia trước khi cập nhật.");
+      return;
+    }
+    if (canManage === false) {
+      setMessage("Bạn không có quyền cập nhật chứng nhận. Chỉ ví của đơn vị phát hành hoặc quản trị viên mới được thực hiện thao tác này.");
+      return;
+    }
+    if (!assetId.trim()) {
+      setMessage("Vui lòng nhập mã chứng nhận cần cập nhật.");
+      return;
+    }
+
+    try {
+      setIsUpdating(true);
+      setMessage("Đang gửi giao dịch cập nhật trạng thái...");
+      const contract = getCertificateRegistry(signer);
+      const updateNote = [note, updateDate ? `Update date: ${updateDate}` : ""].filter(Boolean).join(" | ");
+      const tx = await contract.updateStatus(assetId.trim(), Number(status), updateNote || "Updated from frontend", {
+        gasLimit: 300000,
+      });
+      await tx.wait();
+      setMessage(`Đã cập nhật trạng thái cho ${assetId.trim()}.`);
+    } catch (error) {
+      const reason = (error as { reason?: string; message?: string }).reason;
+      setMessage(reason ? `Giao dịch thất bại: ${reason}` : "Giao dịch thất bại. Kiểm tra mã chứng nhận và trạng thái hiện tại.");
+    } finally {
+      setIsUpdating(false);
+    }
+  };
+
   return (
     <div className="pb-10 lg:pb-14">
       {/* HERO */}
@@ -139,16 +293,26 @@ function UpdateCertificatePage() {
             </div>
 
             <div className="mt-8 grid gap-6 md:grid-cols-2">
+              {canManage === false && (
+                <p className="md:col-span-2 rounded-2xl border border-amber-200 bg-amber-50 px-5 py-4 text-sm font-semibold text-amber-800 dark:border-amber-900/50 dark:bg-amber-950/30 dark:text-amber-300">
+                  Bạn không có quyền cập nhật hoặc xem danh sách chứng nhận. Ví hiện tại chỉ có thể xác thực và xem chi tiết chứng nhận.
+                </p>
+              )}
               <FieldCard label="Mã chứng nhận">
                 <input
                   type="text"
+                  value={assetId}
+                  onChange={(event) => setAssetId(event.target.value)}
                   placeholder="Ví dụ: CERT-2024-001"
                   className="mt-4 h-14 w-full rounded-[18px] border border-slate-200 bg-slate-50 px-4 text-base font-semibold text-slate-800 outline-none transition-all duration-200 placeholder:text-slate-400 focus:border-emerald-300 focus:ring-4 focus:ring-emerald-100 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100 dark:placeholder:text-slate-500 dark:focus:border-emerald-500 dark:focus:ring-emerald-900/30"
                 />
               </FieldCard>
 
               <FieldCard label="Trạng thái mới">
-                <select className="mt-4 h-14 w-full rounded-[18px] border border-slate-200 bg-slate-50 px-4 text-base font-semibold text-slate-800 outline-none transition-all duration-200 focus:border-emerald-300 focus:ring-4 focus:ring-emerald-100 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100 dark:focus:border-emerald-500 dark:focus:ring-emerald-900/30">
+                <select
+                  onChange={(event) => setStatus(String(event.currentTarget.selectedIndex + 1))}
+                  className="mt-4 h-14 w-full rounded-[18px] border border-slate-200 bg-slate-50 px-4 text-base font-semibold text-slate-800 outline-none transition-all duration-200 focus:border-emerald-300 focus:ring-4 focus:ring-emerald-100 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100 dark:focus:border-emerald-500 dark:focus:ring-emerald-900/30"
+                >
                   <option>Hợp lệ</option>
                   <option>Tạm dừng</option>
                   <option>Thu hồi</option>
@@ -157,8 +321,9 @@ function UpdateCertificatePage() {
 
               <FieldCard label="Ngày cập nhật">
                 <input
-                  type="text"
-                  placeholder="20/04/2026"
+                  type="date"
+                  value={updateDate}
+                  onChange={(event) => setUpdateDate(event.target.value)}
                   className="mt-4 h-14 w-full rounded-[18px] border border-slate-200 bg-slate-50 px-4 text-base font-semibold text-slate-800 outline-none transition-all duration-200 placeholder:text-slate-400 focus:border-emerald-300 focus:ring-4 focus:ring-emerald-100 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100 dark:placeholder:text-slate-500 dark:focus:border-emerald-500 dark:focus:ring-emerald-900/30"
                 />
               </FieldCard>
@@ -183,6 +348,8 @@ function UpdateCertificatePage() {
               <FieldCard label="Ghi chú" wide>
                 <textarea
                   rows={5}
+                  value={note}
+                  onChange={(event) => setNote(event.target.value)}
                   placeholder="Mô tả lý do hoặc nội dung thay đổi..."
                   className="mt-4 w-full rounded-[18px] border border-slate-200 bg-slate-50 px-4 py-4 text-base font-medium text-slate-800 outline-none transition-all duration-200 placeholder:text-slate-400 focus:border-emerald-300 focus:ring-4 focus:ring-emerald-100 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100 dark:placeholder:text-slate-500 dark:focus:border-emerald-500 dark:focus:ring-emerald-900/30"
                 />
@@ -192,21 +359,112 @@ function UpdateCertificatePage() {
             <div className="mt-8 flex flex-col gap-4 sm:flex-row">
               <button
                 type="button"
-                className="inline-flex flex-1 items-center justify-center rounded-[22px] bg-emerald-500 px-8 py-4 text-lg font-bold text-white shadow-[0_18px_44px_-18px_rgba(16,185,129,0.38)] transition-all duration-300 hover:-translate-y-0.5 hover:bg-emerald-600"
+                onClick={handleUpdate}
+                disabled={isUpdating || canManage === false}
+                className="inline-flex flex-1 items-center justify-center rounded-[22px] bg-emerald-500 px-8 py-4 text-lg font-bold text-white shadow-[0_18px_44px_-18px_rgba(16,185,129,0.38)] transition-all duration-300 hover:-translate-y-0.5 hover:bg-emerald-600 disabled:cursor-not-allowed disabled:opacity-70"
               >
                 Bắt đầu cập nhật
               </button>
 
               <button
                 type="button"
+                onClick={() => {
+                  if (canManage === false) {
+                    setMessage("Bạn không có quyền xem danh sách chứng nhận. Chỉ ví của đơn vị phát hành hoặc quản trị viên mới được xem danh sách này.");
+                    return;
+                  }
+                  setShowCertificateList(true);
+                }}
                 className="inline-flex flex-1 items-center justify-center rounded-[22px] border border-slate-200 bg-white px-8 py-4 text-lg font-bold text-slate-800 transition-all duration-300 hover:-translate-y-0.5 hover:border-emerald-200 hover:bg-emerald-50 dark:border-slate-700 dark:bg-slate-950/60 dark:text-slate-100 dark:hover:bg-slate-800"
               >
                 Xem danh sách
               </button>
             </div>
+            {message && (
+              <p className="mt-5 rounded-2xl border border-slate-200 bg-white px-5 py-4 text-sm font-semibold text-slate-700 dark:border-slate-800 dark:bg-slate-950/60 dark:text-slate-300">
+                {message}
+              </p>
+            )}
           </div>
         </section>
       </div>
+
+      {showCertificateList && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+          <button
+            type="button"
+            aria-label="Đóng danh sách chứng nhận"
+            onClick={() => setShowCertificateList(false)}
+            className="absolute inset-0 bg-slate-950/55 backdrop-blur-[3px]"
+          />
+
+          <div className="relative z-10 w-full max-w-5xl overflow-hidden rounded-[30px] border border-slate-200 bg-white shadow-[0_40px_120px_-32px_rgba(15,23,42,0.35)] dark:border-slate-700 dark:bg-slate-900">
+            <div className="absolute inset-x-0 top-0 h-1 bg-gradient-to-r from-emerald-500 via-teal-500 to-blue-500" />
+            <div className="p-6 lg:p-8">
+              <div className="flex items-start justify-between gap-4">
+                <div>
+                  <p className="text-sm font-bold uppercase tracking-[0.18em] text-emerald-700 dark:text-emerald-300">
+                    DANH SÁCH CHỨNG NHẬN
+                  </p>
+                  <h3 className="mt-3 text-3xl font-black tracking-[-0.03em] text-slate-900 dark:text-slate-100">
+                    Chọn chứng nhận cần cập nhật
+                  </h3>
+                  <p className="mt-3 max-w-2xl text-base leading-7 text-slate-600 dark:text-slate-400">
+                    Bấm vào một dòng để tự điền mã chứng nhận vào form cập nhật trạng thái.
+                  </p>
+                </div>
+
+                <button
+                  type="button"
+                  onClick={() => setShowCertificateList(false)}
+                  className="inline-flex h-11 w-11 items-center justify-center rounded-full border border-slate-200 bg-white text-xl font-bold text-slate-500 transition hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-300 dark:hover:bg-slate-800"
+                >
+                  ×
+                </button>
+              </div>
+
+              <div className="mt-7 max-h-[520px] overflow-y-auto pr-1">
+                {listMessage && (
+                  <p className="rounded-2xl border border-slate-200 bg-slate-50 px-5 py-4 text-sm font-semibold text-slate-700 dark:border-slate-800 dark:bg-slate-950/60 dark:text-slate-300">
+                    {listMessage}
+                  </p>
+                )}
+
+                <div className="space-y-3">
+                  {certificateList.map((item) => (
+                    <button
+                      key={item.assetId}
+                      type="button"
+                      onClick={() => {
+                        setAssetId(item.assetId);
+                        setShowCertificateList(false);
+                        setMessage(`Đã chọn chứng nhận ${item.assetId}.`);
+                      }}
+                      className="w-full rounded-[22px] border border-slate-100 bg-white px-5 py-4 text-left shadow-sm transition-all duration-200 hover:-translate-y-0.5 hover:border-emerald-200 hover:bg-emerald-50/70 dark:border-slate-800 dark:bg-slate-950/60 dark:hover:bg-slate-800"
+                    >
+                      <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+                        <div className="min-w-0">
+                          <p className="text-sm font-bold uppercase tracking-[0.14em] text-slate-500 dark:text-slate-400">
+                            {item.assetId}
+                          </p>
+                          <p className="mt-2 text-xl font-black text-slate-900 dark:text-slate-100">
+                            {item.holderName}
+                          </p>
+                          <p className="mt-1 text-base text-slate-600 dark:text-slate-400">
+                            {item.assetName}
+                          </p>
+                        </div>
+
+                        <StatusBadge status={item.status} />
+                      </div>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -333,4 +591,57 @@ function SummaryRow({
   );
 }
 
+function StatusBadge({ status }: { status: string }) {
+  const badgeClasses: Record<string, string> = {
+    issued: "border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-900/50 dark:bg-emerald-950/30 dark:text-emerald-300",
+    revoked: "border-rose-200 bg-rose-50 text-rose-700 dark:border-rose-900/50 dark:bg-rose-950/30 dark:text-rose-300",
+    created: "border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-900/50 dark:bg-amber-950/30 dark:text-amber-300",
+    suspended: "border-sky-200 bg-sky-50 text-sky-700 dark:border-sky-900/50 dark:bg-sky-950/30 dark:text-sky-300",
+    default: "border-slate-200 bg-slate-50 text-slate-700 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300",
+  };
+
+  const normalizedStatus = status
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
+  const statusTone = normalizedStatus.includes("phat hanh")
+    ? "issued"
+    : normalizedStatus.includes("thu hoi")
+      ? "revoked"
+      : normalizedStatus.includes("tam dung")
+        ? "suspended"
+        : normalizedStatus.includes("tao")
+          ? "created"
+          : "default";
+
+  return (
+    <span
+      className={`inline-flex min-w-[140px] justify-center rounded-full border px-3 py-1 text-sm font-bold ${badgeClasses[statusTone]}`}
+    >
+      {status}
+    </span>
+  );
+}
+
+function getStatusText(status: number | undefined) {
+  if (status === 1) return "Đã phát hành";
+  if (status === 2) return "Tạm dừng";
+  if (status === 3) return "Đã thu hồi";
+  return "Đã tạo";
+}
+
+function parseContractStatus(value: unknown) {
+  if (typeof value === "number") return value;
+  if (typeof value === "bigint") return Number(value);
+  if (value && typeof (value as { toNumber?: () => number }).toNumber === "function") {
+    return (value as { toNumber: () => number }).toNumber();
+  }
+  if (value !== undefined && value !== null) {
+    const numericValue = Number(value);
+    return Number.isNaN(numericValue) ? undefined : numericValue;
+  }
+  return undefined;
+}
+
 export default UpdateCertificatePage;
+
